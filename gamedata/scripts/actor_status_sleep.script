@@ -1,0 +1,168 @@
+-- Changed for IMM by Faustle (2018)
+-- Edited by Tronex
+-- Date: 2018/11/7
+-- Sleep deprivation
+
+-- Добавляем функцию clamp для удобства
+function math.clamp(val, lower, upper)
+    return math.max(lower, math.min(upper, val))
+end
+
+local last_sleep, last_sleep_chk, pwr_chk
+local feature_state
+
+local up_sleep = 27 -- step
+local in_hour = 1400 -- amount decreased every sleep hour
+local start_blur = {
+    5000, -- gray indicator
+    6250, -- yellow indicator
+    7500, -- orange indicator
+    8750  -- red indicator
+}
+local force = 9000 -- value at which player is forced to sleep
+local force_slp = 10001
+
+local sleep_chk = 300 -- amount of in-game seconds where indicator value increase
+local itn_mul = 0.001
+local eat_sleepiness_mul = 1000
+local pwr_rate, rng_factor = -0.00010, 0.08
+
+function create()
+    printdbg("- Sleep deprivation | Enabled")
+    feature_state = true
+    last_sleep = last_sleep or 0
+    RegisterScriptCallback("actor_on_update", actor_on_update)
+    RegisterScriptCallback("actor_on_item_use", actor_on_item_use)
+    RegisterScriptCallback("actor_on_sleep", actor_on_sleep)
+
+    actor_status.add_indicator("Sleep", {
+        index = 4,
+        typ = "state",
+        functor = {"actor_status_sleep", "get_sleep_deprivation", true},
+        icon = "ui_inGame2_indicator_sleep",
+        background = "ui_inGame2_indicator_slot",
+        anim_icon = false,
+        anim_bk = false,
+    })
+end 
+
+function destroy()
+    printdbg("- Sleep deprivation | Disabled")
+    feature_state = false
+    last_sleep = nil
+    UnregisterScriptCallback("actor_on_update", actor_on_update)
+    UnregisterScriptCallback("actor_on_item_use", actor_on_item_use)
+    UnregisterScriptCallback("actor_on_sleep", actor_on_sleep)
+    alife_storage_manager.get_state().sleep = nil
+    actor_status.add_indicator("Sleep", nil)
+end 
+
+function toggle_feature(val)
+    if val then
+        if not feature_state then create() 
+    elseif not val and feature_state then destroy() end
+end
+
+function test_blur()
+    level.remove_pp_effector(39568)
+    if last_sleep >= start_blur[1] then
+        level.add_pp_effector("yantar_underground_psi.ppe", 39568, false)
+        local blur_level = 0
+        for i, threshold in ipairs(start_blur) do
+            if last_sleep >= threshold then
+                blur_level = i
+            end
+        end
+
+        level.set_pp_effector_factor(39568, (last_sleep - start_blur[1]) * itn_mul)
+        if blur_level >= #start_blur then
+            if last_sleep >= force and math.random(100) <= force_slp and not db.actor:has_info("actor_is_sleeping") then
+                db.actor:give_info_portion("force_slp2")
+                force_sleep()
+            end
+        end
+    end
+end
+
+function force_sleep()
+    ui_sleep_dialog.sleep_forced()
+    actor_menu.set_msg(1, game.translate_string("st_sleep_deprived"), 5)
+    disable_info("force_slp2")
+end
+
+function get_sleep_deprivation(visual)
+    if not last_sleep then return 0 end
+    if visual then -- indicator
+        for i, threshold in ipairs(start_blur) do
+            if last_sleep <= threshold then return i end
+        end
+        return #start_blur
+    end
+    return math.clamp(normalize(last_sleep, 0, 10000), 0, 1)
+end
+
+-------------------------------------------------------------------
+-- Callbacks
+-------------------------------------------------------------------
+function save_state(m_data)
+    if USE_MARSHAL and feature_state then
+        m_data.sleep = {
+            last_sleep = last_sleep,
+            chk_sleep = last_sleep_chk and utils_data.CTime_to_table(last_sleep_chk) or nil
+        }
+        printdbg("# SAVING: Sleep deprivation | last_sleep: %s", tostring(last_sleep))
+    end
+end
+
+function load_state(m_data)
+    local sleep = m_data.sleep
+    if sleep then
+        last_sleep = sleep.last_sleep or last_sleep -- По умолчанию оставляем предыдущее значение
+        last_sleep_chk = sleep.chk_sleep and utils_data.CTime_from_table(sleep.chk_sleep) -- Получение времени только если существует
+        printdbg("# LOADING: Sleep deprivation | last_sleep: %s", tostring(last_sleep))
+    end
+end
+
+function actor_on_sleep(hours)
+    if not db.actor:has_info("force_slp2") then
+        printdbg("/ Sleep deprivation | Reduced sleepiness by sleeping: %s - old sleepiness level: %s", hours * (in_hour / 2), last_sleep)
+        last_sleep = math.clamp((last_sleep or 0) - hours * (in_hour / 2), 0, 10000)
+    end
+end
+
+function actor_on_item_use(item)
+    local sec = item:section()
+    local eat_sleepiness = (ini_sys:r_float_ex(sec, "eat_sleepiness") or 0) * eat_sleepiness_mul 
+    if eat_sleepiness ~= 0 then
+        printdbg("/ Sleep deprivation | item used: %s - old sleepiness level: %s - sleepiness level change: %s", sec, last_sleep, eat_sleepiness)
+        last_sleep = math.clamp((last_sleep + eat_sleepiness), 0, 10000)
+        test_blur()
+    end
+end
+
+function actor_on_update()
+    if get_console_cmd(1, "g_god") then return true end
+
+    local curr_time = game.get_game_time()
+    
+    if last_sleep > start_blur[2] then
+        local tg = time_global()
+        if not pwr_chk or tg > pwr_chk then 
+            if db.actor.power > 0 then
+                db.actor:change_power(pwr_rate * ((last_sleep - start_blur[2]) * rng_factor) / 10)
+            end
+            pwr_chk = tg + 100
+        end
+    end
+    
+    if last_sleep_chk and curr_time:diffSec(last_sleep_chk) < sleep_chk then return end
+    
+    last_sleep_chk = curr_time
+    last_sleep = math.clamp((last_sleep or 0) + up_sleep, 0, 10000)
+    test_blur()
+end
+
+function on_game_start()
+    RegisterScriptCallback("load_state", load_state)
+    RegisterScriptCallback("save_state", save_state)
+end
